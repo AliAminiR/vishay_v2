@@ -73,7 +73,7 @@ class VishayModel:
 class Camera:  # constantly reads frames from a specified webcam.
     def __init__(self, cam_index):
         self.cam_index = cam_index
-        self.cam = cv2.VideoCapture(cam_index)
+        self.cam = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         if not self.cam.isOpened():
             raise ValueError(f"Camera {cam_index} not found or could not be opened.")
 
