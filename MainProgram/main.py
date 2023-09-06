@@ -23,7 +23,6 @@ path_to_json_folder = None
 path_to_img_folder = None
 path_to_model = None
 
-
 # path_to_json_folder = r"C:\Users\A750290\Projects\Vishay\python\MainProgram\output"
 # path_to_img_folder = r"C:\Users\A750290\Projects\Vishay\python\MainProgram\Saved_images"
 # path_to_model = r"C:\Users\A750290\Projects\Vishay\python\Classification\NetModel_first best.pth"
