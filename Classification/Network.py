@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torchvision import datasets, transforms
-from torchvision.models import resnet18
+from torchvision.models import resnet18, resnet50
 
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 class VishayNN:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    classes = ("NiO", "iO")
-    writer = SummaryWriter()
+    classes = ("iO", "NiO")
+    writer = None
 
     model = None
     dataloaders_dict = None
@@ -42,19 +42,29 @@ class VishayNN:
     optimizer = None
     criterion = None
     num_epochs = None
+    best_acc_after_training = 0.0
 
     def __init__(self, batch_size, lr, weight_decay, num_epochs):
         self.batch_size = batch_size
         self.lr = lr
         self.weight_decay = weight_decay
         self.num_epochs = num_epochs
+        self.writer = SummaryWriter(log_dir=f"./runs/runs_current/{datetime.now().strftime('%Y-%m-%d_%H-%M')}", comment=f"LR_{self.lr}_BS_{self.batch_size}_WC_{self.weight_decay}")
+        logger.info(f"Device: {self.device}")
 
     def __del__(self):
         self.writer.close()
 
     def create_vishay_network(self):
         # model = torch.hub.load('pytorch/vision', 'resnet18', weights='ResNet18_Weights.DEFAULT')
-        model = resnet18(weights="ResNet18_Weights.DEFAULT")
+        resnet50_flag = False
+
+        if resnet50_flag:
+            model = resnet18(weights="ResNet18_Weights.DEFAULT")
+            logger.info("Network: Resnet50")
+        else:
+            model = resnet18(weights="ResNet18_Weights.DEFAULT")
+            logger.info("Network: Resnet18")
 
         model.eval()
         # print(model.fc)
@@ -72,28 +82,28 @@ class VishayNN:
                 transforms.RandomResizedCrop((512, 512)),
                 # transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ]),
             'val': transforms.Compose([
                 transforms.Resize((512, 512)),
                 # transforms.CenterCrop(512),
                 transforms.ToTensor(),
-                # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ]),
             'test': transforms.Compose([
                 transforms.Resize((512, 512)),
                 # transforms.CenterCrop(512),
                 transforms.ToTensor(),
-                # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ]),
         }
 
         logger.info("Initializing Datasets and Dataloaders...")
 
         # Create training and validation datasets
-        image_datasets = {x: datasets.ImageFolder(os.path.join(path_to_dataset, x), data_transforms[x]) for x in ['train', 'val', 'test']}
+        image_datasets = {x: ImageFolderWithPaths(os.path.join(path_to_dataset, x), data_transforms[x]) for x in ['train', 'val', 'test']}
         # Create training and validation dataloaders
-        dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=4, shuffle=True, num_workers=4) for x in ['train', 'val', 'test']}
+        dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=self.batch_size, shuffle=True, num_workers=4) for x in ['train', 'val', 'test']}
 
         # test_datasets = ImageFolderWithPaths( os.path.join(r"C:\Users\A750290\Projects\Vishay\Data\cut\Input_cleansed", "test"), data_transforms["test"])
         # test_loader = torch.utils.data.DataLoader(test_datasets, batch_size=4, shuffle=True, num_workers=4)
@@ -107,18 +117,19 @@ class VishayNN:
         else:
             logger.error("nothing to Load. Model is empty!")
 
-    def save_model(self, target_path_model):
+    def save_model(self, target_path_model: str):
         if self.model is not None:
-            torch.save(self.model.state_dict(), target_path_model)
+            torch.save(self.model.state_dict(), target_path_model.split(".pth")[0] + f"_acc_{self.best_acc_after_training:.2f}.pth")
         else:
             logger.error("nothing to Save. Model is empty!")
 
-    def get_mean_std(self):
+    def get_mean_std(self, path):
         # Compute the mean and standard deviation of all pixels in the dataset
         num_pixels = 0
         mean = 0.0
         std = 0.0
-        for images, _ in self.dataloaders_dict["train"]:
+
+        for images, _ in self.dataloaders_dict['train']:
             batch_size, num_channels, height, width = images.shape
             num_pixels += batch_size * height * width
             mean += images.mean(axis=(0, 2, 3)).sum()
@@ -130,7 +141,8 @@ class VishayNN:
         return mean, std
 
     def create_optimizer(self):
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.005, weight_decay=0)
+        # self.optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         self.criterion = nn.CrossEntropyLoss()
 
     def train_model(self, is_inception=False):
@@ -158,7 +170,7 @@ class VishayNN:
                 running_corrects = 0
 
                 # Iterate over data.
-                for inputs, labels, path in self.dataloaders_dict[phase]:
+                for inputs, labels, _paths in self.dataloaders_dict[phase]:
                     inputs = inputs.to(self.device)
                     labels = labels.to(self.device)
 
@@ -181,6 +193,7 @@ class VishayNN:
                         else:
                             outputs = self.model(inputs)
                             loss = self.criterion(outputs, labels)
+                            # loss *= 3
 
                         _, preds = torch.max(outputs, 1)
 
@@ -199,9 +212,14 @@ class VishayNN:
                 if phase == "train":
                     loss_dic["train"] = epoch_loss
                     acc_dic["train"] = epoch_acc.item()
+                    # self.writer.add_scalar("Loss", loss_dic["train"], epoch)
+                    # self.writer.add_scalar("Accuracy", acc_dic["train"], epoch)
+
                 elif phase == "val":
                     loss_dic["val"] = epoch_loss
                     acc_dic["val"] = epoch_acc.item()
+                    # self.writer.add_scalar("Loss", loss_dic["val"], epoch)
+                    # self.writer.add_scalar("Accuracy", acc_dic["val"], epoch)
 
                 logger.info(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
@@ -214,7 +232,7 @@ class VishayNN:
 
             self.writer.add_scalars("Loss", loss_dic, epoch)
             self.writer.add_scalars("Accuracy", acc_dic, epoch)
-            self.writer.flush()
+            # self.writer.flush()
 
         time_elapsed = time.time() - since
         logger.info(f"Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s")
@@ -223,6 +241,7 @@ class VishayNN:
         # load best model weights
         self.model.load_state_dict(best_model_wts)
         self.writer.flush()
+        self.best_acc_after_training = best_acc
 
         return val_acc_history
 
@@ -235,7 +254,7 @@ class VishayNN:
         else:
             with torch.no_grad():
                 for inputs, outputs, paths in self.dataloaders_dict['test']:
-                    now_before = datetime.utcnow()
+                    # now_before = datetime.utcnow()
 
                     inputs = inputs.to(self.device)
                     outputs = outputs.to(self.device)
@@ -244,11 +263,11 @@ class VishayNN:
                     predicted_outputs = self.model(inputs)
                     _, predicted = torch.max(predicted_outputs, 1)
 
-                    now_after = datetime.utcnow()
+                    # now_after = datetime.utcnow()
 
-                    logger.info(f"time before: {now_before}")
-                    logger.info(f"time after: {now_after}")
-                    logger.info(f"time diff: {now_after - now_before}")
+                    # logger.info(f"time before: {now_before}")
+                    # logger.info(f"time after: {now_after}")
+                    # logger.info(f"time diff: {now_after - now_before}")
 
                     total += outputs.size(0)
                     running_accuracy += (predicted == outputs).sum().item()
@@ -369,12 +388,13 @@ class DataAugVishay:
         else:
             for i in range(0, self.num_of_aug_img):
                 seq = iaa.Sequential([
+                    iaa.Crop(px=(0, 80, 0, 80), keep_size=False),
+                    iaa.Resize({"height": 512, "width": "keep-aspect-ratio"}),
+                    # iaa.Pad(px=((50, 50), (0, 0), (50, 50), (0, 0)), pad_mode="edge"),
                     iaa.HorizontalFlip(0.5),
                     iaa.VerticalFlip(0.5),
-                    iaa.TranslateX(px=(-50, 50)),
-                    iaa.TranslateY(px=(-50, 50)),
-                    # iaa.LinearContrast((0.75, 1.5)),
-                    iaa.AddToBrightness((-30, 30))
+                    iaa.TranslateX(px=(-20, 20), mode="edge"),
+                    iaa.TranslateY(px=(-20, 20), mode="edge")
                 ], random_order=True)
 
                 image_names = os.listdir(self.input_dir)
