@@ -1,6 +1,9 @@
 from __future__ import print_function
 from __future__ import division
 
+from sklearn.metrics import confusion_matrix
+import seaborn as sn
+import pandas as pd
 import gc
 import shutil
 
@@ -10,6 +13,10 @@ import torch.optim as optim
 import numpy as np
 from torchvision import datasets, transforms
 from torchvision.models import resnet18, resnet50
+# from torchcam.methods import SmoothGradCAMpp
+from torchcam.methods import CAM
+from PIL import Image
+from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset
@@ -24,6 +31,10 @@ import imgaug.augmenters as iaa
 import imageio.v2 as imageio
 
 import logging
+
+from torchvision.transforms.functional import to_pil_image
+from torchcam.utils import overlay_mask
+from torchvision.io.image import read_image
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +54,30 @@ class VishayNN:
     criterion = None
     num_epochs = None
     best_acc_after_training = 0.0
+    semi_conduct_name = None
+    image_num = 0
+    save_test_images_flag = True
+    model_name: str = None
 
-    def __init__(self, batch_size, lr, weight_decay, num_epochs):
+    def __init__(self, batch_size, lr, weight_decay, num_epochs, semi_conduct_name, save_images, model_name):
         self.batch_size = batch_size
         self.lr = lr
         self.weight_decay = weight_decay
         self.num_epochs = num_epochs
-        self.writer = SummaryWriter(log_dir=f"./runs/runs_current/{datetime.now().strftime('%Y-%m-%d_%H-%M')}", comment=f"LR_{self.lr}_BS_{self.batch_size}_WC_{self.weight_decay}")
+        self.semi_conduct_name = semi_conduct_name
+
+        assert model_name is not None, logger.error("Model name is not provided!")
+        self.model_name = model_name
+
+        self.save_test_images_flag = save_images
+        if save_images:
+            self.path_to_save = f"./models/{self.model_name.split('.')[0]}"
+            if not os.path.exists(self.path_to_save):
+                os.mkdir(self.path_to_save)
+
+        self.writer = SummaryWriter(
+            log_dir=f"./runs/runs_current/{semi_conduct_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}",
+            comment=f"LR_{self.lr}_BS_{self.batch_size}_WC_{self.weight_decay}")
         logger.info(f"Device: {self.device}")
 
     def __del__(self):
@@ -101,25 +129,29 @@ class VishayNN:
         logger.info("Initializing Datasets and Dataloaders...")
 
         # Create training and validation datasets
-        image_datasets = {x: ImageFolderWithPaths(os.path.join(path_to_dataset, x), data_transforms[x]) for x in ['train', 'val', 'test']}
+        image_datasets = {x: ImageFolderWithPaths(os.path.join(path_to_dataset, x), data_transforms[x]) for x in
+                          ['train', 'val', 'test']}
         # Create training and validation dataloaders
-        dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=self.batch_size, shuffle=True, num_workers=4) for x in ['train', 'val', 'test']}
+        dataloaders_dict = {
+            x: torch.utils.data.DataLoader(image_datasets[x], batch_size=self.batch_size, shuffle=True, num_workers=4)
+            for x in ['train', 'val', 'test']}
 
         # test_datasets = ImageFolderWithPaths( os.path.join(r"C:\Users\A750290\Projects\Vishay\Data\cut\Input_cleansed", "test"), data_transforms["test"])
         # test_loader = torch.utils.data.DataLoader(test_datasets, batch_size=4, shuffle=True, num_workers=4)
 
         self.dataloaders_dict = dataloaders_dict
 
-    def load_model(self, path_to_saved_model):
-        # torch.save(model.state_dict(), path)
+    def load_model(self):
         if self.model is not None:
-            self.model.load_state_dict(torch.load(path_to_saved_model))
+            self.model.load_state_dict(torch.load(f"./models/{self.model_name}"))
         else:
             logger.error("nothing to Load. Model is empty!")
 
-    def save_model(self, target_path_model: str):
+    def save_model(self):
+        target_path_model = f"./models/{self.model_name}"
         if self.model is not None:
-            torch.save(self.model.state_dict(), target_path_model.split(".pth")[0] + f"_acc_{self.best_acc_after_training:.2f}.pth")
+            torch.save(self.model.state_dict(),
+                       target_path_model.split(".pth")[0] + f"_acc_{self.best_acc_after_training:.2f}.pth")
         else:
             logger.error("nothing to Save. Model is empty!")
 
@@ -249,12 +281,13 @@ class VishayNN:
         running_accuracy = 0
         total = 0
         step = 0
+        self.image_num = 0
+
         if self.model is None:
             logger.error("Load the model first. model is empty!")
         else:
             with torch.no_grad():
                 for inputs, outputs, paths in self.dataloaders_dict['test']:
-                    # now_before = datetime.utcnow()
 
                     inputs = inputs.to(self.device)
                     outputs = outputs.to(self.device)
@@ -263,47 +296,103 @@ class VishayNN:
                     predicted_outputs = self.model(inputs)
                     _, predicted = torch.max(predicted_outputs, 1)
 
-                    # now_after = datetime.utcnow()
-
-                    # logger.info(f"time before: {now_before}")
-                    # logger.info(f"time after: {now_after}")
-                    # logger.info(f"time diff: {now_after - now_before}")
-
                     total += outputs.size(0)
                     running_accuracy += (predicted == outputs).sum().item()
 
-                    self.writer.add_figure('predictions vs. actuals', self.plot_classes_preds(inputs.to("cpu"), outputs.to("cpu"), paths), global_step=step)
+                    probs = [f.softmax(el, dim=0)[i].item() for i, el in zip(predicted, predicted_outputs)]
 
-                    step += 1
+                    for idx in range(self.batch_size):
+                        self.writer.add_figure('predictions vs. actuals',
+                                               self.plot_classes_predictions(outputs[idx].item(),
+                                                                             paths[idx],
+                                                                             predicted[idx].item(),
+                                                                             probs[idx],
+                                                                             image_with_CAM=False,
+                                                                             cam_image=None),
+                                               global_step=step)
+                        step += 1
                 logger.info(f"Accuracy of the model on test data is: %{(100 * running_accuracy / total)} %%")
 
-    # helper function to show an image
-    # (used in the `plot_classes_preds` function below)
-    @staticmethod
-    def matplotlib_imshow(img, one_channel=False):
-        if one_channel:
-            img = img.mean(dim=0)
-        img = img / 2 + 0.5  # unnormalize
-        npimg = img.numpy()
-        if one_channel:
-            plt.imshow(npimg, cmap="Greys")
+    def test_with_CAM(self):
+
+        running_accuracy = 0
+        total = 0
+        step = 0
+        self.image_num = 0
+
+        if self.model is None:
+            logger.error("Load the model first. model is empty!")
         else:
-            plt.imshow(np.transpose(npimg, (1, 2, 0)))
+            cam = CAM(self.model, 'layer4', 'fc')
+            for inputs, outputs, paths in self.dataloaders_dict['test']:
 
-    def images_to_probs(self, images):
-        """
-        Generates predictions and corresponding probabilities from a trained
-        network and a list of images
-        """
-        output = self.model(images)
-        # convert output probabilities to predicted class
-        _, preds_tensor = torch.max(output, 1)
-        if preds_tensor.shape != 1:
-            preds = np.squeeze(preds_tensor.numpy())
+                inputs = inputs.to(self.device)
+                outputs = outputs.to(self.device)
+                outputs = outputs.to(torch.float32)
+                with torch.no_grad():
+                    predicted_outputs = self.model(inputs)
 
-        return preds, [f.softmax(el, dim=0)[i].item() for i, el in zip(preds, output)]
+                _, predicted = torch.max(predicted_outputs, 1)
+                activation_map = cam(predicted_outputs.squeeze(0).argmax().item(), predicted_outputs)
 
-    def plot_classes_preds(self, images, labels, paths):
+                # Resize the CAM and overlay it
+                cam_image = overlay_mask(to_pil_image(read_image(paths[0])),
+                                         to_pil_image(activation_map[0].squeeze(0), mode='F'),
+                                         alpha=0.5)
+
+                total += outputs.size(0)
+                running_accuracy += (predicted == outputs).sum().item()
+
+                probs = [f.softmax(el, dim=0)[i].item() for i, el in zip(predicted, predicted_outputs)]
+
+                for idx in range(self.batch_size):
+                    self.writer.add_figure('predictions vs. actuals',
+                                           self.plot_classes_predictions(outputs[idx].item(),
+                                                                         paths[idx],
+                                                                         predicted[idx].item(),
+                                                                         probs[idx],
+                                                                         image_with_CAM=True,
+                                                                         cam_image=cam_image),
+                                           global_step=step)
+                    step += 1
+            logger.info(f"Accuracy of the model on test data is: %{(100 * running_accuracy / total)} %%")
+
+    def confusion_matrix(self):
+
+        y_pred = []
+        y_true = []
+
+        # iterate over test data
+        for inputs, labels, paths in self.dataloaders_dict['test']:
+            inputs = inputs.to(self.device)
+            labels = labels.to(self.device)
+            labels = labels.to(torch.float32)
+
+            predicted_outputs = self.model(inputs)
+
+            output = (torch.max(torch.exp(predicted_outputs), 1)[1]).data.cpu().numpy()
+            y_pred.extend(output)  # Save Prediction
+
+            labels = labels.data.cpu().numpy()
+            y_true.extend(labels)  # Save Truth
+
+        # Build confusion matrix
+        cf_matrix = confusion_matrix(y_true, y_pred)
+        if len(self.classes) == 2:
+            logging.info(f"TP: {cf_matrix[0, 0]}")
+            logging.info(f"TN: {cf_matrix[1, 1]}")
+            logging.info(f"FP: {cf_matrix[1, 0]}")
+            logging.info(f"FN: {cf_matrix[0, 1]}")
+            logging.info(f"Precision: {cf_matrix[0, 0] / (cf_matrix[0, 0] + cf_matrix[1, 0])}")
+            logging.info(f"Recall: {cf_matrix[0, 0] / (cf_matrix[0, 0] + cf_matrix[0, 1])}")
+
+        df_cm = pd.DataFrame(cf_matrix / np.sum(cf_matrix, axis=1)[:, None], index=[i for i in self.classes],
+                             columns=[i for i in self.classes])
+        plt.figure(figsize=(12, 7))
+        sn.heatmap(df_cm, annot=True)
+        plt.savefig('output.png')
+
+    def plot_classes_predictions(self, label, path, pred, prob, image_with_CAM, cam_image):
         """
         Generates matplotlib Figure using a trained network, along with images
         and labels from a batch, that shows the network's top prediction along
@@ -311,23 +400,39 @@ class VishayNN:
         information based on whether the prediction was correct or not.
         Uses the "images_to_probs" function.
         """
-        self.model.to("cpu")
-        preds, probs = self.images_to_probs(images)
-        # plot the images in the batch, along with predicted and true labels
-        fig = plt.figure()
-        fig.set_figheight(15)
-        fig.set_figwidth(15)
-        for idx in np.arange(4):
-            ax = fig.add_subplot(1, 4, idx + 1, xticks=[], yticks=[])
-            # matplotlib_imshow(images[idx], one_channel=False)
-            plt.imshow(plt.imread(paths[idx]), interpolation='nearest')
+        file_name = Path(path).stem
+        if image_with_CAM:
+            fig = plt.figure()
+            fig.set_figheight(5)
+            fig.set_figwidth(10)
+            ax = fig.add_subplot(1, 2, 1, xticks=[], yticks=[])
+            plt.imshow(plt.imread(path), interpolation='nearest')
             ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
-                self.classes[preds[idx]],
-                probs[idx] * 100.0,
-                self.classes[int(labels[idx].item())]),
-                color=("green" if preds[idx] == labels[idx].item() else "red"))
+                self.classes[pred],
+                prob * 100.0,
+                self.classes[int(label)]),
+                color=("green" if pred == label else "red"))
 
-        self.model.to(self.device)
+            ax = fig.add_subplot(1, 2, 2, xticks=[], yticks=[])
+            plt.imshow(cam_image, interpolation='nearest')
+            ax.axis('off')
+            ax.set_title(f"image name: \n{file_name}")
+
+        else:
+            fig = plt.figure()
+            fig.set_figheight(15)
+            fig.set_figwidth(15)
+            ax = fig.add_subplot(1, 1, 1, xticks=[], yticks=[])
+            plt.imshow(plt.imread(path), interpolation='nearest')
+            ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
+                self.classes[pred],
+                prob * 100.0,
+                self.classes[int(label)]),
+                color=("green" if pred == label.item() else "red"))
+
+        self.image_num += 1
+        if self.save_test_images_flag:
+            fig.savefig(os.path.join(self.path_to_save, f"IMAGE_{self.image_num}.png"))
         return fig
 
 
@@ -382,19 +487,18 @@ class DataAugVishay:
                 shutil.move(os.path.join(path, file), dataset_path)
 
     def data_aug_vishay(self):
-
         if self.input_dir and self.output_dir is None:
             logger.error("Input and output folder paths are None!")
         else:
             for i in range(0, self.num_of_aug_img):
                 seq = iaa.Sequential([
-                    iaa.Crop(px=(0, 80, 0, 80), keep_size=False),
+                    iaa.Crop(px=(0, 50, 0, 50), keep_size=False),
                     iaa.Resize({"height": 512, "width": "keep-aspect-ratio"}),
                     # iaa.Pad(px=((50, 50), (0, 0), (50, 50), (0, 0)), pad_mode="edge"),
                     iaa.HorizontalFlip(0.5),
                     iaa.VerticalFlip(0.5),
                     iaa.TranslateX(px=(-20, 20), mode="edge"),
-                    iaa.TranslateY(px=(-20, 20), mode="edge")
+                    # iaa.TranslateY(px=(-20, 20), mode="edge")
                 ], random_order=True)
 
                 image_names = os.listdir(self.input_dir)
